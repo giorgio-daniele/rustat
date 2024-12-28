@@ -1,10 +1,10 @@
-use std::{collections::HashMap, net::Ipv4Addr};
+use std::{collections::HashMap, net::Ipv4Addr, time::{Duration, SystemTime, UNIX_EPOCH}};
 use clap::Parser;
-use pcap::{Capture, Offline};
+use pcap::{Capture, Offline, Stat};
 
-const ETHERNET_HEADER_SIZE: usize = 14; // Ethernet header size in bytes
-const MIN_IP_HEADER_SIZE: usize = 20;  // Minimum size of IPv4 header
-const MIN_TCP_HEADER_SIZE: usize = 20; // Minimum size of TCP header
+const ETHERNET_HEADER_SIZE: usize = 14;  // Ethernet header size in bytes
+const MIN_IP_HEADER_SIZE: usize   = 20;  // Minimum size of IPv4 header
+const MIN_TCP_HEADER_SIZE: usize  = 20;  // Minimum size of TCP header
 
 #[derive(PartialEq, Eq, Hash, Clone)]
 struct Connection {
@@ -12,6 +12,12 @@ struct Connection {
     dip:   Ipv4Addr,
     sport: u16,
     dport: u16,
+}
+
+#[derive(PartialEq, Eq, Hash, Clone)]
+enum Status {
+    Opened,
+    Closed,
 }
 
 struct Metrics {
@@ -24,11 +30,35 @@ struct Metrics {
     rsts:  usize,
     pshs:  usize,
     urgs:  usize,
+    stat:  Status,
+    ts:    u64,
+    te:    u64
 }
 
 impl Metrics {
     fn new() -> Metrics {
-        Metrics { packs: 0, bytes: 0, segms: 0, acks: 0, syns: 0, fins: 0, rsts: 0, pshs: 0, urgs: 0 }
+        Metrics { 
+            packs: 0, 
+            bytes: 0, 
+            segms: 0, 
+            acks:  0, 
+            syns:  0, 
+            fins:  0, 
+            rsts:  0, 
+            pshs:  0, 
+            urgs:  0, stat: Status::Opened, ts: 0, te: 0 }
+    }
+    fn set_closed(& mut self) {
+        self.stat = Status::Closed
+    }
+    fn set_opened(& mut self) {
+        self.stat = Status::Opened
+    }
+    fn set_ts(&mut self, ts: u64) {
+        self.ts = ts
+    }
+    fn set_te(&mut self, te: u64) {
+        self.te = te
     }
 }
 
@@ -45,7 +75,15 @@ fn process_trace(mut cap: Capture<Offline>) {
     let mut connections: HashMap<Connection, (Metrics, Metrics)> = HashMap::new();
 
     while let Ok(pkt) = cap.next_packet() {
+        // Get the packet len
         let len = pkt.header.len as usize;
+
+        // Get the timestamp
+        let sec  = pkt.header.ts.tv_sec  as u64;
+        let usec = pkt.header.ts.tv_usec as u64;
+
+        // Generate the timestamp
+        let ts = sec * 1_000_000 + usec;
 
         if len < ETHERNET_HEADER_SIZE {
             continue; // Skip packets that are too short
@@ -129,8 +167,30 @@ fn process_trace(mut cap: Capture<Offline>) {
             }
         };
 
-        if syn && !ack {
+        // Client open a new connection
+        if syn && !ack && sip.is_private() {
             connections.insert(key.clone(), (Metrics::new(), Metrics::new()));
+            if let Some((metric, _)) = connections.get_mut(&key) {
+                metric.set_opened();
+                metric.set_ts(ts);
+                
+            }
+        // Server accept the connection
+        } else if syn && ack && !sip.is_private() {
+            if let Some((_, metric)) = connections.get_mut(&rev) {
+                metric.set_opened();
+                metric.set_ts(ts);
+            }
+        // A peer wants to disconnect
+        } else if rst || fin {
+            if let Some((metric, _)) = connections.get_mut(&key) {
+                metric.set_closed();
+                metric.set_te(ts);
+            }
+            if let Some((_, metric)) = connections.get_mut(&rev) {
+                metric.set_closed();
+                metric.set_te(ts);
+            }
         }
 
         if let Some((metric, _)) = connections.get_mut(&key) {
@@ -142,17 +202,22 @@ fn process_trace(mut cap: Capture<Offline>) {
     }
 
     // Print connections
-    println!("sip sport packs bytes segms syns fins rsts pshs urgs acks dip dport packs bytes segms syns fins rsts pshs urgs acks");
+    println!("sip sport packs bytes segms syns fins rsts pshs urgs acks ts te dip dport packs bytes segms syns fins rsts pshs urgs acks ts te complete");
     for (connection, (client, server)) in connections {
+        let complete = if client.stat == Status::Closed && server.stat == Status::Closed {
+            1 
+        } else {
+            0
+        };
         println!(
-            "{} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+            "{} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
             connection.sip, connection.sport,
             client.packs, client.bytes, client.segms, 
-                client.syns, client.fins, client.rsts, client.pshs, client.urgs, client.acks,
+                client.syns, client.fins, client.rsts, client.pshs, client.urgs, client.acks, client.ts, client.te,
             connection.dip, connection.dport,
             server.packs, server.bytes, server.segms, 
-                server.syns, server.fins, server.rsts, server.pshs, server.urgs, server.acks
-        );
+                server.syns, server.fins, server.rsts, server.pshs, server.urgs, server.acks, server.ts, server.te,
+                complete);
     }
 }
 
@@ -166,12 +231,12 @@ struct Args {
 }
 
 fn main() {
-    let args = Args::parse();
+    // let args = Args::parse();
 
-    // The input trace
-    let input = args.input;
+    // // The input trace
+    // let input = args.input;
 
-    match Capture::from_file(input) {
+    match Capture::from_file("test.pcap") {
         Ok(capture) => process_trace(capture),
         Err(error) => {
             println!("[ERROR]: {}", error);
