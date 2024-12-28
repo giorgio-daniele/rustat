@@ -1,0 +1,9 @@
+[package]
+name = "rustnet"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.5.23", features = ["derive"] }
+etherparse = "0.16.0"
+pcap = "2.2.0"
