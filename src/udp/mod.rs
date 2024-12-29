@@ -3,14 +3,14 @@ use std::{collections::HashMap, fs::File, io::{self, Write}, net::Ipv4Addr, path
 
 #[derive(PartialEq, Eq, Hash, Clone)]
 pub struct Connection {
-    sip:  Ipv4Addr,
-    dip:  Ipv4Addr,
+    sip:   Ipv4Addr,
+    dip:   Ipv4Addr,
     sport: u16,
     dport: u16,
 }
 
 impl Connection {
-    pub fn new(sip: Ipv4Addr, dip: Ipv4Addr, sport: u16, dport: u16) -> Connection {
+    fn new(sip: Ipv4Addr, dip: Ipv4Addr, sport: u16, dport: u16) -> Connection {
         Connection {
             sip,
             dip,
@@ -18,7 +18,7 @@ impl Connection {
             dport,
         }
     }
-    pub fn rev(sip: Ipv4Addr, dip: Ipv4Addr, sport: u16, dport: u16) -> Connection {
+    fn rev(sip: Ipv4Addr, dip: Ipv4Addr, sport: u16, dport: u16) -> Connection {
         Connection {
             sip: dip,
             dip: sip,
@@ -36,17 +36,13 @@ impl fmt::Display for Connection {
     }
 }
 
+
 #[derive(PartialEq, Eq, Hash, Clone)]
 struct Statistics {
     packs: usize,
     bytes: usize,
-    segms: usize,
-    acks: usize,
-    syns: usize,
-    fins: usize,
-    rsts: usize,
-    pshs: usize,
-    urgs: usize,
+    datas: usize,
+    last:  u64,
     ts: u64,
     te: u64,
 }
@@ -56,13 +52,8 @@ impl Statistics {
         Statistics {
             packs: 0,
             bytes: 0,
-            segms: 0,
-            acks: 0,
-            syns: 0,
-            fins: 0,
-            rsts: 0,
-            pshs: 0,
-            urgs: 0,
+            datas: 0,
+            last:  0,
             ts: 0,
             te: 0,
         }
@@ -75,6 +66,12 @@ impl Statistics {
     }
 }
 
+#[derive(PartialEq, Eq, Hash, Clone)]
+pub struct Metrics {
+    client: Statistics,
+    server: Statistics,
+}
+
 impl Metrics {
     fn new() -> Metrics {
         Metrics {
@@ -84,18 +81,11 @@ impl Metrics {
     }
 }
 
-#[derive(PartialEq, Eq, Hash, Clone)]
-pub struct Metrics {
-    client: Statistics,
-    server: Statistics,
-}
-
 impl fmt::Display for Statistics {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         // Propagate the result from write! with the `?` operator
-        write!(f, "{} {} {} {} {} {} {} {} {} {} {}",
-            self.packs, self.bytes, self.segms, self.acks, self.syns, self.fins,
-            self.rsts,  self.pshs,  self.urgs,  self.ts,   self.te)?;
+        write!(f, "{} {} {} {} {}",
+            self.packs, self.bytes, self.datas, self.ts, self.te)?;
         Ok(())
     }
 }
@@ -119,52 +109,28 @@ fn ip4_addresses(packet: &[u8], eth_head_len: usize) -> (Ipv4Addr, Ipv4Addr) {
     (sip, dip)
 }
 
-fn update(v: &mut Statistics, load: usize, flags: u8) {
-    // Get all TCP flags
-    let syn = (flags & 0x02) != 0;
-    let ack = (flags & 0x10) != 0;
-    let fin = (flags & 0x01) != 0;
-    let rst = (flags & 0x04) != 0;
-    let psh = (flags & 0x08) != 0;
-    let urg = (flags & 0x20) != 0;
+fn update(v: &mut Statistics, load: usize, ts: u64) {
+    // Update timestamp last packet observed
+    v.last = ts;
 
-    // Update the number of TCP segments
-    v.segms += 1;
+    // Update the number of UDP datagrams
+    v.datas += 1;
 
     // Update the payload related count
     if load > 0 {
         v.packs += 1;
         v.bytes += load;
     }
-
-    // Update the flag conuters
-    if syn {
-        v.syns += 1;
-    }
-    if ack {
-        v.acks += 1;
-    }
-    if fin {
-        v.fins += 1;
-    }
-    if rst {
-        v.rsts += 1;
-    }
-    if psh {
-        v.pshs += 1;
-    }
-    if urg {
-        v.urgs += 1;
-    }
 }
+
 
 pub fn process_packet(ts: u64, packet: &[u8], eth_len: usize, ip_len: usize, data: &mut HashMap<Connection, Metrics>) {
 
     // Compute the length of the packet, compute the UDP header size and
     // then the payload size which is within the UDP datagram
     let len = packet.len() as usize;
+    let hed = 8 as usize;
     let off = eth_len + ip_len;
-    let hed = ((packet[off + 12] >> 4) as usize) * 4;
 
     if len < hed + off { 
         return; // The packet is too short, then skip it
@@ -184,50 +150,73 @@ pub fn process_packet(ts: u64, packet: &[u8], eth_len: usize, ip_len: usize, dat
     let key = Connection::new(sip, dip, sport, dport);
     let rev = Connection::rev(sip, dip, sport, dport);
 
-    // Get all TCP flags
-    let flags = packet[off + 13];
-    let syn = (flags & 0x02) != 0;
-    let ack = (flags & 0x10) != 0;
-    let fin = (flags & 0x01) != 0;
-    let rst = (flags & 0x04) != 0;
-
-    /*  TCP is a connection oriented protocol. The data exchange starts as soon
-    as SYN packet is detected. SYN = 1 and ACK = 0 for who wants to establish
-    the connection, and SYN = 1 and ACK = 1 for the other peer that accepts 
-    the connection. The data exchange finishes as soon as a peer is fed up
-    and transmits FIN or RST */
-
-    if syn && !ack && sip.is_private() {
-        data.insert(key.clone(), Metrics::new());
-        if let Some(metrics) = data.get_mut(&key) {
-            metrics.client.set_ts(ts);
-        }
-    } else if syn && ack && !sip.is_private() {
-        if let Some(metrics) = data.get_mut(&key) {
-            metrics.server.set_ts(ts);
-        }
-    } else if rst || fin {
-        if let Some(metrics) = data.get_mut(&key) {
-            metrics.client.set_te(ts);
-        }
-        if let Some(metrics) = data.get_mut(&rev) {
-            metrics.client.set_te(ts);
-        }
-    }
+    /*  UDP is not connection oriented, therefore C2S and S2C flows 
+    are not correlated. Therefore, they are traced seperately. 
+    Using the convention that the client starts data exchage, a 
+    new data exchange is decteted if observing a UDP datagram 
+    from private IP address to a remote IP address whose socket
+    has not been already observed. */
 
     if let Some(metrics) = data.get_mut(&key) {
-        update(&mut metrics.client, pay, flags);
+        update(&mut metrics.client, pay, ts);
     }
-    if let Some(metrics) = data.get_mut(&rev) {
-        update(&mut metrics.server, pay, flags);
+    else if let Some(metrics) = data.get_mut(&rev) {
+        update(&mut metrics.server, pay, ts);
+
+        /* If the reverse key exists, this could be the first
+        packet in the data flow on reverse direction. Therefore,
+        is the ts is not already set, set it up */
+
+        if metrics.server.ts == 0 {
+            metrics.server.set_ts(ts);
+        }
+
+
+    } else {
+
+        /* Neither the direct nor the reverse key has been found.
+        We detected a UDP segment from a key toward a key which
+        have not seen before. Therefore, this is a new data flow.
+        Conventionally, data exchange is tracked using the client
+        perspective. If the the sender is remote, create the
+        record, but update the server side */
+        
+        if sip.is_private() {
+            let mut metrics = Metrics::new();
+            metrics.client.set_ts(ts);
+            update(&mut metrics.client, pay, ts);
+            data.insert(key, metrics);
+        } else {
+            let mut metrics = Metrics::new();
+            metrics.server.set_ts(ts);
+            update(&mut metrics.server, pay, ts);   
+            data.insert(rev, metrics);     
+        }
+    
     }
+
+    // Define the timeout value
+    let timeout = 30 * 1_000_000;
+
+    /* If no data is detected for regisered flows,
+    fix the timestamp for te */
+
+    for (_, metrics) in data.iter_mut() {
+        if metrics.client.last > timeout {
+            metrics.client.set_te(ts);
+        }
+        if metrics.server.last > timeout {
+            metrics.server.set_te(ts);
+        }
+    }
+
 }
 
 pub fn print_data(path: & mut PathBuf, data: & HashMap<Connection, Metrics>) -> io::Result<()> {
     // Generate the header
     let header = "c_ip c_port s_ip s_port \
-                  c_packs c_bytes c_segms c_acks c_syns c_fins c_rsts c_pshs c_urgs c_ts c_te \
-                  s_packs s_bytes s_segms s_acks s_syns s_fins s_rsts s_pshs s_urgs s_ts s_te";
+                  c_packs c_bytes c_datas c_ts c_te \
+                  s_packs s_bytes s_datas s_ts s_te";
 
     // Get the buffer
     let mut buffer: Vec<u8> = header.as_bytes().to_vec();
@@ -245,6 +234,7 @@ pub fn print_data(path: & mut PathBuf, data: & HashMap<Connection, Metrics>) -> 
         buffer.extend_from_slice(record.as_bytes());
     }
 
+
     // Open a file to write
     let mut file = File::create(path)?;
 
@@ -253,3 +243,4 @@ pub fn print_data(path: & mut PathBuf, data: & HashMap<Connection, Metrics>) -> 
 
     Ok(())
 }
+
