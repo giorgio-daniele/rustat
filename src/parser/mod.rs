@@ -36,17 +36,24 @@ fn process_tcp_packet(ts: u64, len: usize, l3_header: &Ipv4Header, l4_header: &T
             if fin { // FIN = 1
                 metrics.get_sender().update_packs_fin();
                 metrics.get_sender().set_last_pack(ts);
-                metrics.get_sender().set_te(ts);    
+                metrics.get_sender().set_te(ts); 
+                metrics.get_sender().update_packs();   
             } else if rst { // RST = 1
                 metrics.get_sender().update_packs_rst();
                 metrics.get_sender().set_last_pack(ts);
-                metrics.get_sender().set_te(ts);    
+                metrics.get_sender().set_te(ts);
+                metrics.get_sender().update_packs();   
             } else {        // Just a packet
                 if ack { metrics.get_sender().update_packs_ack(); }
                 if urg { metrics.get_sender().update_packs_urg(); }
                 if psh { metrics.get_sender().update_packs_psh(); }
-                metrics.get_sender().update_packs_data();
-                metrics.get_sender().update_bytes(bytes as u64);
+                if bytes > 0 {
+                    metrics.get_sender().update_packs_data();
+                    metrics.get_sender().update_bytes(bytes as u64);
+                }
+                metrics.get_sender().update_packs(); 
+                metrics.get_sender().set_last_pack(ts);
+                
             } 
         },
         None => {
@@ -55,6 +62,11 @@ fn process_tcp_packet(ts: u64, len: usize, l3_header: &Ipv4Header, l4_header: &T
                     let mut metrics = TcpDataExchange::new();
                     metrics.get_sender().apply(|sender| {
                         sender.update_packs_syn();
+                        if bytes > 0 {
+                            sender.update_packs_data();
+                            sender.update_bytes(bytes as u64);
+                        }
+                        sender.update_packs(); 
                         sender.set_last_pack(ts);
                         sender.set_ts(ts);
                     });
@@ -70,23 +82,42 @@ fn process_tcp_packet(ts: u64, len: usize, l3_header: &Ipv4Header, l4_header: &T
             if syn && ack { // SYN = 1 and ACK = 1
                 metrics.get_receiver().update_packs_syn();
                 metrics.get_receiver().update_packs_ack();
+                if bytes > 0 {
+                    metrics.get_receiver().update_packs_data();
+                    metrics.get_receiver().update_bytes(bytes as u64);
+                }
+                metrics.get_receiver().update_packs(); 
                 metrics.get_receiver().set_last_pack(ts);
-                metrics.get_receiver().set_ts(ts);               
+                metrics.get_receiver().set_ts(ts);              
             }
             else if fin { // FIN = 1
                 metrics.get_receiver().update_packs_fin();
+                if bytes > 0 {
+                    metrics.get_receiver().update_packs_data();
+                    metrics.get_receiver().update_bytes(bytes as u64);
+                }
+                metrics.get_receiver().update_packs(); 
                 metrics.get_receiver().set_last_pack(ts);
                 metrics.get_receiver().set_te(ts);    
             } else if rst { // RST = 1
                 metrics.get_receiver().update_packs_rst();
+                if bytes > 0 {
+                    metrics.get_receiver().update_packs_data();
+                    metrics.get_receiver().update_bytes(bytes as u64);
+                }
+                metrics.get_receiver().update_packs(); 
                 metrics.get_receiver().set_last_pack(ts);
                 metrics.get_receiver().set_te(ts);    
-            } else {        // Just a packet
+            } else {   // Just a packet
                 if ack { metrics.get_receiver().update_packs_ack(); }
                 if urg { metrics.get_receiver().update_packs_urg(); }
                 if psh { metrics.get_receiver().update_packs_psh(); }
-                metrics.get_receiver().update_packs_data();
-                metrics.get_receiver().update_bytes(bytes as u64);
+                if bytes > 0 {
+                    metrics.get_receiver().update_packs_data();
+                    metrics.get_receiver().update_bytes(bytes as u64);
+                }
+                metrics.get_receiver().update_packs(); 
+                metrics.get_receiver().set_last_pack(ts);
             } 
         },
         None => { /* Ignore it */ }
@@ -115,20 +146,20 @@ fn process_udp_packet(ts: u64, len: usize, l3_header: &Ipv4Header, l4_header: &U
 
     match map.get_mut(&tx_key) {
         Some(metrics) => {
-            metrics.get_sender().set_last_pack(ts);
             metrics.get_sender().update_packs_data();
             metrics.get_sender().update_bytes(bytes as u64);
             metrics.get_sender().update_packs();
+            metrics.get_sender().set_last_pack(ts);
         },
         None => {
             map.entry(tx_key).or_insert_with(|| {
                 let mut metrics = UdpDataExchange::new();
                 metrics.get_sender().apply(|sender| {
                     sender.set_ts(ts);
-                    sender.set_last_pack(ts);
                     sender.update_packs_data();
                     sender.update_bytes(bytes as u64);
                     sender.update_packs();
+                    sender.set_last_pack(ts);
                 });
                 metrics
             });
@@ -138,23 +169,23 @@ fn process_udp_packet(ts: u64, len: usize, l3_header: &Ipv4Header, l4_header: &U
     match map.get_mut(&rx_key) {
         Some(metrics) => {
             if metrics.get_receiver().get_ts() == 0 {
+                metrics.get_receiver().update_packs_data();
+                metrics.get_receiver().update_bytes(bytes as u64);
+                metrics.get_receiver().update_packs();
                 metrics.get_receiver().set_ts(ts);
                 metrics.get_receiver().set_last_pack(ts);
-                metrics.get_receiver().update_packs_data();
-                metrics.get_receiver().update_bytes(bytes as u64);
-                metrics.get_receiver().update_packs();
             } else {
-                metrics.get_receiver().set_last_pack(ts);
                 metrics.get_receiver().update_packs_data();
                 metrics.get_receiver().update_bytes(bytes as u64);
                 metrics.get_receiver().update_packs();
+                metrics.get_receiver().set_last_pack(ts);
             }
         },
         None => { /* Ignore it */ }
     }
 
     // Define the timeout
-    let timeout = 120 * 1_000_000;
+    let timeout = 30 * 1_000_000;
 
     for data in map.values_mut() {
         let sender = data.get_sender();
