@@ -1,3 +1,4 @@
 /target
 test.pcap
 Cargo.lock
+*.out
