@@ -4,9 +4,9 @@ pub mod parser;
 pub mod datatype;
 
 use clap::Parser;
+use datatype::{Ipv4Connection, TcpDataExchange, UdpDataExchange};
 use pcap::Capture;
-use core::net;
-use std::{fs, io, net::Ipv4Addr, path::Path, str::FromStr};
+use std::{collections::HashMap, fs, io, net::Ipv4Addr, path::Path, str::FromStr};
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -69,11 +69,20 @@ fn main() -> io::Result<()> {
 
     match Capture::from_file(input) {
         Ok(capture) => {
-           let (mut tcp, mut udp) = parser::process_trace(capture, (network, mask));
-           // Print TCP
-           let _ = parser::print_tcp_data(&mut log_tcp, &mut tcp);
-           // Print UDP
-           let _ = parser::print_udp_data(&mut log_udp, &mut udp);
+
+            // Define the TCP connections map
+            let mut tcp_map: HashMap<Ipv4Connection, TcpDataExchange> = HashMap::new();
+
+            // Define the UDP connections map
+            let mut udp_map: HashMap<Ipv4Connection, UdpDataExchange> = HashMap::new();
+
+            // Process trace
+            parser::process_trace(capture, (network, mask), &mut tcp_map, &mut udp_map);
+           
+            // Print TCP
+            let _ = parser::print_tcp_data(&mut log_tcp, &mut tcp_map);
+            // Print UDP
+            let _ = parser::print_udp_data(&mut log_udp, &mut udp_map);
         }
         Err(error) => {
             eprintln!("[ERROR]: {}", error);

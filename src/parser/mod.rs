@@ -1,5 +1,6 @@
 use std::{collections::HashMap, fs::File, io::{self, Write}, net::Ipv4Addr, path::PathBuf};
 use pcap::{Capture, Offline};
+use tls_parser::parse_tls_plaintext;
 
 use crate::datatype::{Ipv4Connection, TcpDataExchange, UdpDataExchange};
 use etherparse::{ip_number::{TCP, UDP}, Ethernet2Header, Ipv4Header, TcpHeader, UdpHeader};
@@ -17,6 +18,7 @@ fn is_ipv4_lan(ip: Ipv4Addr, subnet: (Ipv4Addr, u8)) -> bool {
     // Apply the mask to both the IP and subnet, then compare
     (ip_num & mask) == (sb_num & mask)
 }
+
 
 fn process_tcp_packet(ts: u64, len: usize, l3_header: &Ipv4Header, l4_header: &TcpHeader, map: &mut HashMap<Ipv4Connection, TcpDataExchange>, subnet: (Ipv4Addr, u8)) {
     let sip: Ipv4Addr = Ipv4Addr::from(l3_header.source);
@@ -38,7 +40,7 @@ fn process_tcp_packet(ts: u64, len: usize, l3_header: &Ipv4Header, l4_header: &T
     let l3_header_size: usize = l3_header.header_len() as usize;
     let l4_header_size: usize = l4_header.header_len() as usize;
 
-    let bytes = if len > (l3_header_size + l4_header_size) {
+    let bytes: usize = if len > (l3_header_size + l4_header_size) {
         len - l3_header_size  - l4_header_size
     } else {
         0 // No payload or invalid packet
@@ -76,10 +78,6 @@ fn process_tcp_packet(ts: u64, len: usize, l3_header: &Ipv4Header, l4_header: &T
                     let mut metrics = TcpDataExchange::new();
                     metrics.get_sender().apply(|sender| {
                         sender.update_packs_syn();
-                        if bytes > 0 {
-                            sender.update_packs_data();
-                            sender.update_bytes(bytes as u64);
-                        }
                         sender.update_packs(); 
                         sender.set_last_pack(ts);
                         sender.set_ts(ts);
@@ -96,29 +94,17 @@ fn process_tcp_packet(ts: u64, len: usize, l3_header: &Ipv4Header, l4_header: &T
             if syn && ack && is_ipv4_lan(dip, subnet) { // SYN = 1 and ACK = 1
                 metrics.get_receiver().update_packs_syn();
                 metrics.get_receiver().update_packs_ack();
-                if bytes > 0 {
-                    metrics.get_receiver().update_packs_data();
-                    metrics.get_receiver().update_bytes(bytes as u64);
-                }
                 metrics.get_receiver().update_packs(); 
                 metrics.get_receiver().set_last_pack(ts);
                 metrics.get_receiver().set_ts(ts);              
             }
             else if fin { // FIN = 1
                 metrics.get_receiver().update_packs_fin();
-                if bytes > 0 {
-                    metrics.get_receiver().update_packs_data();
-                    metrics.get_receiver().update_bytes(bytes as u64);
-                }
                 metrics.get_receiver().update_packs(); 
                 metrics.get_receiver().set_last_pack(ts);
                 metrics.get_receiver().set_te(ts);    
             } else if rst { // RST = 1
                 metrics.get_receiver().update_packs_rst();
-                if bytes > 0 {
-                    metrics.get_receiver().update_packs_data();
-                    metrics.get_receiver().update_bytes(bytes as u64);
-                }
                 metrics.get_receiver().update_packs(); 
                 metrics.get_receiver().set_last_pack(ts);
                 metrics.get_receiver().set_te(ts);    
@@ -178,11 +164,11 @@ fn process_udp_packet(ts: u64, len: usize, l3_header: &Ipv4Header, l4_header: &U
                 map.entry(tx_key).or_insert_with(|| {
                     let mut metrics = UdpDataExchange::new();
                     metrics.get_sender().apply(|sender| {
-                        sender.set_ts(ts);
                         sender.update_packs_data();
                         sender.update_bytes(bytes as u64);
                         sender.update_packs();
                         sender.set_last_pack(ts);
+                        sender.set_ts(ts);
                     });
                     metrics
                 });
@@ -199,8 +185,8 @@ fn process_udp_packet(ts: u64, len: usize, l3_header: &Ipv4Header, l4_header: &U
                 receiver.update_packs_data();
                 receiver.update_bytes(bytes as u64);
                 receiver.update_packs();
-                receiver.set_ts(ts);
                 receiver.set_last_pack(ts);
+                receiver.set_ts(ts);
             } else {
                 // Update the receiver with the new data
                 receiver.update_packs_data();
@@ -210,8 +196,7 @@ fn process_udp_packet(ts: u64, len: usize, l3_header: &Ipv4Header, l4_header: &U
             }
         },
         None => {
-            // Optionally, handle the case when `rx_key` does not exist (if needed)
-            // For example, logging or ignoring
+            // Ignore it
         }
     }
 
@@ -232,13 +217,9 @@ fn process_udp_packet(ts: u64, len: usize, l3_header: &Ipv4Header, l4_header: &U
 
 }
 
-pub fn process_trace(mut capture: Capture<Offline>, subnet: (Ipv4Addr, u8)) -> (HashMap<Ipv4Connection, TcpDataExchange>, HashMap<Ipv4Connection, UdpDataExchange>) {
-
-    // Define the TCP connections map
-    let mut tcp_map: HashMap<Ipv4Connection, TcpDataExchange> = HashMap::new();
-
-    // Define the UDP connections map
-    let mut udp_map: HashMap<Ipv4Connection, UdpDataExchange> = HashMap::new();
+pub fn process_trace(mut capture: Capture<Offline>, subnet: (Ipv4Addr, u8),
+        tcp_map: &mut HashMap<Ipv4Connection, TcpDataExchange>,
+        udp_map: &mut HashMap<Ipv4Connection, UdpDataExchange>) {
 
     while let Ok(packet) = capture.next_packet() {
         // Metadata
@@ -262,21 +243,18 @@ pub fn process_trace(mut capture: Capture<Offline>, subnet: (Ipv4Addr, u8)) -> (
         // Layer 4
         match l3.protocol {
             TCP => {
-                if let Ok((l4, _)) = TcpHeader::from_slice(data) {
-                    process_tcp_packet(ts, len, &l3, &l4, &mut tcp_map, subnet);
+                if let Ok((l4, data)) = TcpHeader::from_slice(data) {
+                    process_tcp_packet(ts, len, &l3, &l4, tcp_map, subnet);                    
                 }
             }
             UDP => {
                 if let Ok((l4, _)) = UdpHeader::from_slice(data) {
-                    process_udp_packet(ts, len, &l3, &l4, &mut udp_map, subnet);
+                    process_udp_packet(ts, len, &l3, &l4, udp_map, subnet);
                 }
             }
             _ => continue
         }
     }
-
-    return (tcp_map, udp_map)
-
 
 }
 
